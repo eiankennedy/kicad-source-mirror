@@ -530,12 +530,18 @@ std::vector<BOARD_ITEM*> PCB_EDIT_FRAME::FindItemsFromSyncSelection( std::string
 }
 
 
+void WorkbenchPcbMail( PCB_EDIT_FRAME* aFrame, std::string& aPayload );   // workbench_dock.cpp
+
 void PCB_EDIT_FRAME::KiwayMailIn( KIWAY_MAIL_EVENT& mail )
 {
     std::string& payload = mail.GetPayload();
 
     switch( mail.Command() )
     {
+    case MAIL_WORKBENCH:
+        WorkbenchPcbMail( this, payload );
+        break;
+
     case MAIL_PCB_GET_NETLIST:
     {
         NETLIST          netlist;

@@ -58,7 +58,8 @@ enum MAIL_T
     MAIL_RELOAD_LIB,           // Reload Library List if one was added
     MAIL_RELOAD_PLUGINS,       // Reload python plugins
     MAIL_REFRESH_SYMBOL,       // Refresh symbol in symbol viewer
-    MAIL_SCH_NAVIGATE_TO_SHEET // Navigate to sheet by filename if in hierarchy
+    MAIL_SCH_NAVIGATE_TO_SHEET, // Navigate to sheet by filename if in hierarchy
+    MAIL_WORKBENCH             // A command from Workbench to the docked editor (JSON in, reply JSON out)
 };
 
 #endif  // MAIL_TYPE_H_

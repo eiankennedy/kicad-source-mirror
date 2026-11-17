@@ -1881,6 +1881,8 @@ void PCB_EDIT_FRAME::SetActiveLayer( PCB_LAYER_ID aLayer, bool aForceRedraw )
 }
 
 
+void WorkbenchPcbWatch( PCB_EDIT_FRAME* aFrame );   // workbench_dock.cpp
+
 void PCB_EDIT_FRAME::OnBoardLoaded()
 {
     wxFileName fn( GetBoard()->GetFileName() );
@@ -2011,6 +2013,8 @@ void PCB_EDIT_FRAME::OnBoardLoaded()
     SetStatusText( wxEmptyString );
 
     KIPLATFORM::APP::SetShutdownBlockReason( this, _( "PCB file changes are unsaved" ) );
+
+    WorkbenchPcbWatch( this );   // docked in Workbench: the build swarm follows this board's changes
 }
 
 

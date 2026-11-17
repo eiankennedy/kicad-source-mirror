@@ -112,6 +112,7 @@ endif()
 
 add_executable( kicad WIN32 MACOSX_BUNDLE
     kicad.cpp
+    workbench_commands.cpp
     ${KICAD_SRCS}
     ${KICAD_EXTRA_SRCS}
     ${KICAD_RESOURCES}

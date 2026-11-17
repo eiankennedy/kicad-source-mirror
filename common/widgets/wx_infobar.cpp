@@ -20,6 +20,7 @@
 
 #include <id.h>
 #include <kiplatform/ui.h>
+#include <kiplatform/workbench.h>
 #include <widgets/wx_infobar.h>
 #include "wx/artprov.h"
 #include <wx/aui/framemanager.h>
@@ -67,9 +68,17 @@ WX_INFOBAR::WX_INFOBAR( wxWindow* aParent, wxAuiManager* aMgr, wxWindowID aWinid
     SetForegroundColour( fg );
 
 #ifdef __WXMAC__
-    // Infobar is broken on Mac without the effects
-    SetShowHideEffects( wxSHOW_EFFECT_ROLL_TO_BOTTOM, wxSHOW_EFFECT_ROLL_TO_TOP );
-    SetEffectDuration( 200 );
+    // Infobar is broken on Mac without the effects. Docked in Workbench, though, an effect waits for frames that a
+    // window out of sight (or a locked screen) never draws, and freezes KiCad: no effect there.
+    if( KIPLATFORM::WORKBENCH::Docked() )
+    {
+        SetShowHideEffects( wxSHOW_EFFECT_NONE, wxSHOW_EFFECT_NONE );
+    }
+    else
+    {
+        SetShowHideEffects( wxSHOW_EFFECT_ROLL_TO_BOTTOM, wxSHOW_EFFECT_ROLL_TO_TOP );
+        SetEffectDuration( 200 );
+    }
 #else
     // Infobar freezes canvas on Windows with the effect, and GTK looks bad with it
     SetShowHideEffects( wxSHOW_EFFECT_NONE, wxSHOW_EFFECT_NONE );

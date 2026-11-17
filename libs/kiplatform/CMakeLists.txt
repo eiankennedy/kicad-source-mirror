@@ -42,6 +42,7 @@ if( APPLE )
         os/apple/secrets.mm
         os/apple/sysinfo.cpp
         os/apple/printing.mm
+        os/apple/workbench.mm
         )
 
     set( PLATFORM_LIBS
@@ -52,6 +53,7 @@ if( APPLE )
         "-framework PDFKit"
         "-framework WebKit"
         "-framework CFNetwork"
+        "-framework QuartzCore"
         )
 elseif( WIN32 )
     list( APPEND PLATFORM_SRCS
@@ -63,6 +65,7 @@ elseif( WIN32 )
         os/windows/secrets.cpp
         os/windows/sysinfo.cpp
         os/windows/printing.cpp
+        os/common/workbench_stub.cpp
         )
 
     set( PLATFORM_LIBS
@@ -82,6 +85,7 @@ elseif( UNIX )
         os/unix/secrets.cpp
         os/unix/sysinfo.cpp
         os/unix/printing.cpp
+        os/common/workbench_stub.cpp
         )
 
     # Detect the secret library and configure it

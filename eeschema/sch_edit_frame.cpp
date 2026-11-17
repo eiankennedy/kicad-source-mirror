@@ -3039,6 +3039,8 @@ void SCH_EDIT_FRAME::ToggleRemoteSymbolPanel()
 }
 
 
+void WorkbenchSchWatch( SCH_EDIT_FRAME* aFrame );   // workbench_dock.cpp
+
 void SCH_EDIT_FRAME::SetSchematic( SCHEMATIC* aSchematic )
 {
     wxCHECK( aSchematic, /* void */ );
@@ -3056,6 +3058,8 @@ void SCH_EDIT_FRAME::SetSchematic( SCHEMATIC* aSchematic )
     static_cast<KIGFX::SCH_PAINTER*>( view->GetPainter() )->SetSchematic( m_schematic );
     m_toolManager->SetEnvironment( m_schematic, GetCanvas()->GetView(), GetCanvas()->GetViewControls(), config(),
                                    this );
+
+    WorkbenchSchWatch( this );   // docked in Workbench: the build swarm follows this schematic's changes
 }
 
 

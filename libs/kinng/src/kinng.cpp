@@ -20,7 +20,9 @@
 
 #include <kinng.h>
 #include <nng/nng.h>
-#include <nng/protocol/reqrep0/rep.h>
+#if __has_include( <nng/protocol/reqrep0/rep.h> )
+#include <nng/protocol/reqrep0/rep.h>   // nng 1.x
+#endif
 #include <wx/log.h>
 
 
@@ -90,6 +92,11 @@ void KINNG_REQUEST_SERVER::listenThread()
 
     wxLogTrace( TraceNng, wxS( "KINNG_REQUEST_SERVER starting" ) );
 
+#if defined( NNG_MAJOR_VERSION ) && NNG_MAJOR_VERSION >= 2
+    static const int nngInit = nng_init( nullptr );   // nng 2.x is set up once before first use
+    (void) nngInit;
+#endif
+
     retCode = nng_rep0_open( &socket );
 
     if( retCode != 0 )
@@ -117,24 +124,24 @@ void KINNG_REQUEST_SERVER::listenThread()
 
     while( !m_shutdown.load() )
     {
-        char*    buf = nullptr;
-        size_t   sz;
+        nng_msg* msg = nullptr;
         uint64_t val;
 
-        retCode = nng_recv( socket, &buf, &sz, NNG_FLAG_ALLOC );
+        // a message rather than an allocated buffer: works with nng 1.x and 2.x (which dropped NNG_FLAG_ALLOC)
+        retCode = nng_recvmsg( socket, &msg, 0 );
 
         if( retCode == NNG_ETIMEDOUT )
             continue;
 
         if( retCode != 0 )
         {
-            nng_free( buf, sz );
             wxLogTrace( TraceNng,
                         wxString::Format( wxS( "Got error code %d from nngc_recv!" ), retCode ) );
             break;
         }
 
-        m_sharedMessage.assign( buf, sz );
+        m_sharedMessage.assign( static_cast<const char*>( nng_msg_body( msg ) ), nng_msg_len( msg ) );
+        nng_msg_free( msg );
 
         if( m_callback )
             m_callback( &m_sharedMessage );
@@ -156,5 +163,9 @@ void KINNG_REQUEST_SERVER::listenThread()
 
     wxLogTrace( TraceNng, wxS( "KINNG_REQUEST_SERVER shutting down" ) );
 
+#if defined( NNG_MAJOR_VERSION ) && NNG_MAJOR_VERSION >= 2
+    nng_socket_close( socket );
+#else
     nng_close( socket );
+#endif
 }

@@ -22,6 +22,7 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA
  */
 
+#include <kiplatform/workbench.h>
 #include <confirm.h>
 
 #include <functional>
@@ -41,6 +42,11 @@ static const wxChar traceConfirm[] = wxT( "KICAD_CONFIRM" );
 
 bool AskOverrideLock( wxWindow* aParent, const wxString& aMessage )
 {
+    // Docked in Workbench, KiCad is the session's editor: a lock left by an earlier run of it is no reason to stop
+    // (and no one could answer the question while Workbench drives it)
+    if( KIPLATFORM::WORKBENCH::Docked() )
+        return true;
+
 #ifdef __APPLE__
     // wxMessageDialog gets the button spacing wrong on Mac so we have to use wxRichMessageDialog.
     // Note that its warning icon is more like wxMessageDialog's error icon, so we use it instead

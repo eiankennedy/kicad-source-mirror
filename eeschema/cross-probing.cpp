@@ -847,12 +847,18 @@ findItemsFromSyncSelection( const SCHEMATIC& aSchematic, const std::string aSync
 }
 
 
+void WorkbenchSchMail( SCH_EDIT_FRAME* aFrame, std::string& aPayload );   // workbench_dock.cpp
+
 void SCH_EDIT_FRAME::KiwayMailIn( KIWAY_MAIL_EVENT& mail )
 {
     std::string& payload = mail.GetPayload();
 
     switch( mail.Command() )
     {
+    case MAIL_WORKBENCH:
+        WorkbenchSchMail( this, payload );
+        break;
+
     case MAIL_ADD_LOCAL_LIB:
     {
         std::stringstream ss( payload );

@@ -62,6 +62,9 @@
 
 #include <kiplatform/app.h>
 #include <kiplatform/environment.h>
+#include <kiplatform/workbench.h>
+
+std::string WorkbenchCommand( KICAD_MANAGER_FRAME* aFrame, const std::string& aRequest );   // workbench_commands.cpp
 
 #ifdef KICAD_IPC_API
 #include <api/api_server.h>
@@ -263,8 +266,12 @@ bool PGM_KICAD::OnPgmInit()
                                                 wxWindow::FromDIP( wxSize( 775, -1 ), NULL ) );
         frame = managerFrame;
 
-        STARTWIZARD startWizard;
-        startWizard.CheckAndRun( frame );
+        // docked in Workbench: its settings start as a copy of the user's, nothing to set up
+        if( !KIPLATFORM::WORKBENCH::Docked() )
+        {
+            STARTWIZARD startWizard;
+            startWizard.CheckAndRun( frame );
+        }
     }
     else
     {
@@ -410,6 +417,17 @@ bool PGM_KICAD::OnPgmInit()
 
     frame->Show( true );
     frame->Raise();
+
+    // Docked in Workbench's Electrical panel: Workbench drives the project manager, which stays out of sight
+    if( KIPLATFORM::WORKBENCH::Docked() && managerFrame )
+    {
+        KIPLATFORM::WORKBENCH::Start(
+                [managerFrame]( const std::string& aRequest )
+                {
+                    return WorkbenchCommand( managerFrame, aRequest );
+                } );
+        KIPLATFORM::WORKBENCH::HideWindow( managerFrame );
+    }
 
 #ifdef KICAD_IPC_API
     m_api_server->SetReadyToReply();
