@@ -68,8 +68,26 @@ bool screen_rect( PCB_EDIT_FRAME* aFrame, const BOX2I& aBox, double& x, double& 
     x1 = std::min( double( client.x ), x1 );
     y1 = std::min( double( client.y ), y1 );
 
-    if( x1 - x0 < 3 || y1 - y0 < 3 )
-        return false;
+    if( x1 <= x0 || y1 <= y0 )   // off screen
+    {
+        if( x1 < x0 || y1 < y0 )
+            return false;
+    }
+
+    // a wire or a track is a line: a strip a robot can still draw along
+    if( x1 - x0 < 6 )
+    {
+        const double c = ( x0 + x1 ) / 2;
+        x0 = c - 3;
+        x1 = c + 3;
+    }
+
+    if( y1 - y0 < 6 )
+    {
+        const double c = ( y0 + y1 ) / 2;
+        y0 = c - 3;
+        y1 = c + 3;
+    }
 
     x = origin.x + x0;
     y = origin.y + y0;
@@ -114,6 +132,8 @@ class WORKBENCH_BOARD_LISTENER : public BOARD_LISTENER
 {
 public:
     explicit WORKBENCH_BOARD_LISTENER( PCB_EDIT_FRAME* aFrame ) : m_frame( aFrame ) {}
+
+    void SetFrame( PCB_EDIT_FRAME* aFrame ) { m_frame = aFrame; }   // a frame made again (after another project opened)
 
     void OnBoardItemAdded( BOARD&, BOARD_ITEM* aItem ) override { act_out( m_frame, aItem, true ); }
     void OnBoardItemsAdded( BOARD&, std::vector<BOARD_ITEM*>& aItems ) override
@@ -203,7 +223,13 @@ void set_hands( PCB_EDIT_FRAME* aFrame, bool aOff )
 
 void WorkbenchPcbWatch( PCB_EDIT_FRAME* aFrame )
 {
-    if( !KIPLATFORM::WORKBENCH::Docked() || !aFrame->GetBoard() || g_watched == aFrame->GetBoard() )
+    if( !KIPLATFORM::WORKBENCH::Docked() || !aFrame->GetBoard() )
+        return;
+
+    if( g_listener )
+        g_listener->SetFrame( aFrame );
+
+    if( g_watched == aFrame->GetBoard() )
         return;
 
     if( !g_listener )
@@ -255,21 +281,32 @@ void WorkbenchPcbMail( PCB_EDIT_FRAME* aFrame, std::string& aPayload )
             BOARD* board = aFrame->GetBoard();
             int    added = 0, changed = 0;
 
+            std::vector<std::pair<KIID, bool>> work;   // what changed, and whether it's new
+            BOX2I                              where;
+
             for( const auto& [id, box] : snapshot( board ) )
             {
                 auto it = before.find( id );
 
-                if( it == before.end() )
+                if( it == before.end() || it->second != box )
                 {
-                    act_out( aFrame, board->ResolveItem( id, true ), true );
-                    ++added;
-                }
-                else if( it->second != box )
-                {
-                    act_out( aFrame, board->ResolveItem( id, true ), false );
-                    ++changed;
+                    work.emplace_back( id, it == before.end() );
+                    where.Merge( box );
+                    ++( it == before.end() ? added : changed );
                 }
             }
+
+            // the robots act it out where it can be seen: the whole board in view when some of it is outside
+            if( !work.empty() && KIPLATFORM::WORKBENCH::SwarmOn() )
+            {
+                const BOX2D view = aFrame->GetCanvas()->GetView()->GetViewport();
+
+                if( !view.Contains( BOX2D( VECTOR2D( where.GetOrigin() ), VECTOR2D( where.GetSize() ) ) ) )
+                    aFrame->GetToolManager()->RunAction( ACTIONS::zoomFitScreen );
+            }
+
+            for( const auto& [id, isNew] : work )
+                act_out( aFrame, board->ResolveItem( id, true ), isNew );
 
             aFrame->GetCanvas()->Refresh();
             result = { { "added", added }, { "changed", changed } };

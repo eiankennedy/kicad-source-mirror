@@ -45,6 +45,9 @@ if( APPLE )
         os/apple/workbench.mm
         )
 
+    # Workbench's docking keeps windows, layers and colours of its own across calls: reference counted for it
+    set_source_files_properties( os/apple/workbench.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc" )
+
     set( PLATFORM_LIBS
         "-framework Cocoa"
         "-framework AppKit"

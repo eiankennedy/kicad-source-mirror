@@ -23,6 +23,7 @@
  */
 
 #include <kidialog.h>
+#include <kiplatform/workbench.h>
 #include <unordered_map>
 
 
@@ -97,6 +98,13 @@ int KIDIALOG::ShowModal()
 
     if( it != g_doNotShowAgainDlgs.end() )
         return it->second;
+
+    // docked in Workbench while one of its commands runs: no one could answer (the command reports it instead)
+    if( KIPLATFORM::WORKBENCH::Busy() )
+    {
+        KIPLATFORM::WORKBENCH::Asked( std::string( GetMessage().ToUTF8() ) );
+        return wxID_CANCEL;
+    }
 
     int ret = KIDIALOG_BASE::ShowModal();
 

@@ -27,6 +27,10 @@ namespace WORKBENCH
 {
 bool Docked() { return false; }
 std::string Accent() { return std::string(); }
+bool Busy() { return false; }
+UNSAVED UnsavedAnswer() { return UNSAVED::ASK; }
+void SetUnsavedAnswer( UNSAVED ) {}
+void Asked( const std::string& ) {}
 void Start( std::function<std::string( const std::string& )> ) {}
 void SetDockedWindow( wxWindow* ) {}
 void HideWindow( wxWindow* ) {}

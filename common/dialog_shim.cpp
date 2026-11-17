@@ -37,6 +37,7 @@
 #include <settings/settings_manager.h>
 #include <tool/tool_manager.h>
 #include <kiplatform/ui.h>
+#include <kiplatform/workbench.h>
 #include <widgets/text_ctrl_eval.h>
 #include <widgets/unit_binder.h>
 
@@ -1656,6 +1657,13 @@ void DIALOG_SHIM::ClearModify()
 
 int DIALOG_SHIM::ShowModal()
 {
+    // docked in Workbench while one of its commands runs: no one could answer (the command reports it instead)
+    if( KIPLATFORM::WORKBENCH::Busy() )
+    {
+        KIPLATFORM::WORKBENCH::Asked( std::string( GetTitle().ToUTF8() ) );
+        return wxID_CANCEL;
+    }
+
     // Apple in its infinite wisdom will raise a disabled window before even passing
     // us the event, so we have no way to stop it.  Instead, we must set an order on
     // the windows so that the modal will be pushed in front of the disabled

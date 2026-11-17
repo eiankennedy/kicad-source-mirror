@@ -40,6 +40,36 @@
 static const wxChar traceConfirm[] = wxT( "KICAD_CONFIRM" );
 
 
+// Docked in Workbench, while one of its commands runs: no dialog (no one could answer it, and the command would
+// hang until someone did). The question goes into the command's error instead; true when that's the case.
+static bool workbenchBusy( const wxString& aMessage )
+{
+    if( !KIPLATFORM::WORKBENCH::Busy() )
+        return false;
+
+    KIPLATFORM::WORKBENCH::Asked( std::string( aMessage.ToUTF8() ) );
+    return true;
+}
+
+
+// The answer to a "Save changes?" question while a Workbench command runs, or 0 to ask as usual
+static int workbenchUnsavedAnswer( const wxString& aMessage )
+{
+    using KIPLATFORM::WORKBENCH::UNSAVED;
+
+    switch( KIPLATFORM::WORKBENCH::UnsavedAnswer() )
+    {
+    case UNSAVED::ASK:     return 0;
+    case UNSAVED::SAVE:    return wxID_YES;
+    case UNSAVED::DISCARD: return wxID_NO;
+    case UNSAVED::CANCEL:  break;
+    }
+
+    KIPLATFORM::WORKBENCH::Asked( std::string( aMessage.ToUTF8() ) );
+    return wxID_CANCEL;
+}
+
+
 bool AskOverrideLock( wxWindow* aParent, const wxString& aMessage )
 {
     // Docked in Workbench, KiCad is the session's editor: a lock left by an earlier run of it is no reason to stop
@@ -71,6 +101,14 @@ int UnsavedChangesDialog( wxWindow* parent, const wxString& aMessage, bool* aApp
 {
     static bool s_apply_to_all = false;
 
+    if( int answer = workbenchUnsavedAnswer( aMessage ) )
+    {
+        if( aApplyToAll )
+            *aApplyToAll = true;
+
+        return answer;
+    }
+
     KICAD_RICH_MESSAGE_DIALOG_BASE dlg( parent, aMessage, _( "Save Changes?" ),
                                         wxYES_NO | wxCANCEL |
                                         wxYES_DEFAULT | wxICON_WARNING | wxCENTER );
@@ -96,6 +134,9 @@ int UnsavedChangesDialog( wxWindow* parent, const wxString& aMessage, bool* aApp
 
 int UnsavedChangesDialog( wxWindow* parent, const wxString& aMessage )
 {
+    if( int answer = workbenchUnsavedAnswer( aMessage ) )
+        return answer;
+
 #ifdef __APPLE__
     // wxMessageDialog gets the button order (and spacing) wrong on Mac so we have to use
     // wxRichMessageDialog.
@@ -142,6 +183,12 @@ int UnsavedChangesDialog( wxWindow* parent, const wxString& aMessage )
 
 bool ConfirmRevertDialog( wxWindow* parent, const wxString& aMessage )
 {
+    if( KIPLATFORM::WORKBENCH::UnsavedAnswer() == KIPLATFORM::WORKBENCH::UNSAVED::DISCARD )
+        return true;
+
+    if( workbenchBusy( aMessage ) )
+        return false;
+
     KICAD_MESSAGE_DIALOG_BASE dlg( parent, aMessage, wxEmptyString,
                                    wxOK | wxCANCEL | wxOK_DEFAULT | wxICON_WARNING | wxCENTER );
     dlg.SetExtendedMessage( _( "Your current changes will be permanently lost." ) );
@@ -176,6 +223,9 @@ int OKOrCancelDialog( wxWindow* aParent, const wxString& aWarning, const wxStrin
                       const wxString& aDetailedMessage, const wxString& aOKLabel,
                       const wxString& aCancelLabel, bool* aApplyToAll )
 {
+    if( workbenchBusy( aWarning + wxS( ": " ) + aMessage ) )
+        return wxID_CANCEL;
+
     KICAD_RICH_MESSAGE_DIALOG_BASE dlg( aParent, aMessage, aWarning,
                                         wxOK | wxCANCEL | wxOK_DEFAULT | wxICON_WARNING | wxCENTER );
 
@@ -201,6 +251,9 @@ int OKOrCancelDialog( wxWindow* aParent, const wxString& aWarning, const wxStrin
 // DisplayError should be deprecated, use DisplayErrorMessage instead
 void DisplayError( wxWindow* aParent, const wxString& aText )
 {
+    if( workbenchBusy( aText ) )
+        return;
+
     if( !wxTheApp || !wxTheApp->IsMainLoopRunning() )
     {
         wxLogError( "%s", aText );
@@ -226,6 +279,9 @@ void DisplayError( wxWindow* aParent, const wxString& aText )
 
 void DisplayErrorMessage( wxWindow* aParent, const wxString& aText, const wxString& aExtraInfo )
 {
+    if( workbenchBusy( aExtraInfo.IsEmpty() ? aText : aText + wxS( " " ) + aExtraInfo ) )
+        return;
+
     if( !wxTheApp || !wxTheApp->IsMainLoopRunning() )
     {
         wxLogError( "%s %s", aText, aExtraInfo );
@@ -254,6 +310,9 @@ void DisplayErrorMessage( wxWindow* aParent, const wxString& aText, const wxStri
 
 void DisplayInfoMessage( wxWindow* aParent, const wxString& aMessage, const wxString& aExtraInfo )
 {
+    if( KIPLATFORM::WORKBENCH::Busy() )   // nothing to answer: no dialog, and no error either
+        return;
+
     if( !wxTheApp || !wxTheApp->GetTopWindow() )
     {
         wxLogTrace( traceConfirm, wxS( "%s %s" ), aMessage, aExtraInfo );
@@ -283,6 +342,9 @@ void DisplayInfoMessage( wxWindow* aParent, const wxString& aMessage, const wxSt
 
 bool IsOK( wxWindow* aParent, const wxString& aMessage )
 {
+    if( workbenchBusy( aMessage ) )
+        return false;
+
     // wxMessageDialog no longer responds correctly to the <ESC> key (on at least OSX and MSW)
     // so we're now using wxRichMessageDialog.
     //
@@ -309,6 +371,9 @@ bool IsOK( wxWindow* aParent, const wxString& aMessage )
 int SelectSingleOption( wxWindow* aParent, const wxString& aTitle,
                         const wxString& aMessage, const wxArrayString& aOptions )
 {
+    if( workbenchBusy( aTitle + wxS( ": " ) + aMessage ) )
+        return -1;
+
     wxSingleChoiceDialog dlg( aParent, aMessage, aTitle, aOptions );
 
     if( dlg.ShowModal() != wxID_OK )

@@ -107,6 +107,30 @@ std::string mail_docked( KICAD_MANAGER_FRAME* aFrame, const json& aRequest )
 
     return reply.contains( "result" ) ? reply["result"].dump() : std::string( "null" );
 }
+
+// each open editor's unsaved changes saved, before its project closes
+void save_editors( KICAD_MANAGER_FRAME* aFrame )
+{
+    for( FRAME_T type : { FRAME_SCH, FRAME_PCB_EDITOR } )
+    {
+        KIWAY_PLAYER* player = aFrame->Kiway().Player( type, false );
+
+        if( !player || !player->IsContentModified() )
+            continue;
+
+        std::string payload = json( { { "cmd", "save" } } ).dump();
+        aFrame->Kiway().ExpressMail( type, MAIL_WORKBENCH, payload );
+        json reply = json::parse( payload, nullptr, false );
+
+        if( reply.is_discarded() || !reply.value( "ok", false ) )
+        {
+            std::string why = reply.is_object() ? reply.value( "error", std::string() ) : std::string();
+            throw std::runtime_error( std::string( "couldn't save the open " )
+                                      + ( type == FRAME_SCH ? "schematic" : "board" ) + " first"
+                                      + ( why.empty() ? "" : ": " + why ) );
+        }
+    }
+}
 } // namespace
 
 
@@ -132,8 +156,16 @@ std::string WorkbenchCommand( KICAD_MANAGER_FRAME* aFrame, const std::string& aR
         if( fn.GetExt() != wxT( "kicad_pro" ) )
             fn.SetExt( wxT( "kicad_pro" ) );
 
+        if( !fn.IsAbsolute() )
+            fn.MakeAbsolute();
+
         if( !fn.FileExists() )
             throw std::runtime_error( "no project at " + std::string( fn.GetFullPath().ToUTF8() ) );
+
+        // the editors' unsaved changes are saved first, silently, as Workbench's other apps do (closing the
+        // project would otherwise ask, with no one to answer)
+        KIPLATFORM::WORKBENCH::SetUnsavedAnswer( KIPLATFORM::WORKBENCH::UNSAVED::SAVE );
+        save_editors( aFrame );
 
         if( !aFrame->LoadProject( fn ) )
             throw std::runtime_error( "couldn't open the project" );
@@ -146,6 +178,7 @@ std::string WorkbenchCommand( KICAD_MANAGER_FRAME* aFrame, const std::string& aR
 
     if( cmd == "show" )
     {
+        KIPLATFORM::WORKBENCH::SetUnsavedAnswer( KIPLATFORM::WORKBENCH::UNSAVED::SAVE );
         const std::string editor = req.value( "editor", std::string( "sch" ) );
         show_editor( aFrame, editor == "pcb" ? FRAME_PCB_EDITOR : FRAME_SCH );
         g_editor = editor;
@@ -167,6 +200,11 @@ std::string WorkbenchCommand( KICAD_MANAGER_FRAME* aFrame, const std::string& aR
         KIPLATFORM::WORKBENCH::SwarmLabel( req.value( "text", std::string() ) );
         return "true";
     }
+
+    if( cmd == "reload" )   // the files on disk are the truth: what the editor had unsaved goes, without asking
+        KIPLATFORM::WORKBENCH::SetUnsavedAnswer( KIPLATFORM::WORKBENCH::UNSAVED::DISCARD );
+    else if( cmd == "save" )
+        KIPLATFORM::WORKBENCH::SetUnsavedAnswer( KIPLATFORM::WORKBENCH::UNSAVED::SAVE );
 
     if( cmd == "hands" || cmd == "reload" || cmd == "save" || cmd == "fit" || cmd == "inspect" )
         return mail_docked( aFrame, req );

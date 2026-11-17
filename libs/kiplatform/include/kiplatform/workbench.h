@@ -48,6 +48,29 @@ namespace WORKBENCH
     /// and returns the result as JSON text; it throws std::exception for an error.
     void Start( std::function<std::string( const std::string& )> aHandler );
 
+    /// What a "Save changes?" question gets while one of Workbench's commands runs: no one could answer a dialog
+    /// then (KiCad is out of sight or driven by Claude), so none is shown.
+    enum class UNSAVED
+    {
+        ASK,       ///< no command running: ask as usual
+        SAVE,      ///< save first (opening another project)
+        DISCARD,   ///< the file on disk wins (reloading after Claude wrote it)
+        CANCEL     ///< anything else: the command stops with an error rather than wait on a dialog
+    };
+
+    /// True while one of Workbench's commands runs (on the main thread).
+    bool Busy();
+
+    /// The answer to a "Save changes?" question now (ASK when no command runs).
+    UNSAVED UnsavedAnswer();
+
+    /// For the command running now: how a "Save changes?" question is answered (CANCEL by default).
+    void SetUnsavedAnswer( UNSAVED aAnswer );
+
+    /// A question or message KiCad would have shown while a command runs (no dialog is shown): the command's
+    /// error says it when the command fails.
+    void Asked( const std::string& aMessage );
+
     /// The window Workbench places over its panel (an editor frame); any earlier one goes out of sight.
     void SetDockedWindow( wxWindow* aFrame );
 

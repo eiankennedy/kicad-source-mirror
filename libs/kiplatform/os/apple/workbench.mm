@@ -35,13 +35,101 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
 
+#include <wx/dialog.h>
+#include <wx/progdlg.h>
+#include <wx/toplevel.h>
 #include <wx/window.h>
 
 namespace
 {
-NSWindow* g_dock = nil;     // the editor window over Workbench's panel
-NSDictionary* g_place = nil; // the last placement
-std::function<std::string( const std::string& )> g_handler;
+// ---------------------------------------------------------------- the swarm
+
+constexpr double FLY = 0.45, DRAG = 0.55, AFTER = 0.9;
+constexpr size_t BASE = 4;
+
+struct Bot
+{
+    CALayer* layer = nil;
+    NSPoint  pos = NSZeroPoint;
+    NSPoint  from = NSZeroPoint;
+    double   free_at = 0;
+    bool     leaving = false;
+    double   press = 0;
+    long     gesture = -1;
+    NSColor* color = nil;
+};
+
+struct Gesture
+{
+    long                  id;
+    size_t                bot;
+    NSRect                rect; // overlay coords (top-left origin, flipped view)
+    double                start;
+    std::string           text;
+    bool                  click;
+    CAShapeLayer*         box = nil;
+    CATextLayer*          tag = nil;
+    std::function<void()> drawn;
+    bool                  done = false;
+};
+
+struct Swarm
+{
+    bool                 on = false;
+    NSColor*             accent = nil;
+    std::string          label;
+    std::vector<Bot>     bots;
+    std::vector<Gesture> gestures;
+    long                 next = 0;
+    double               last_hit = 0;
+    NSWindow*            overlay = nil;
+    CALayer*             root = nil;
+    NSTimer*             timer = nil;
+};
+
+// KiCad's executable and each editor (a kiface, a library of its own) link a copy of this file: they share one
+// state, kept where every copy finds it, so the editors' changes reach the swarm and the dialogs know a command runs
+struct Shared
+{
+    NSWindow*                                        dock = nil;    // the editor window over Workbench's panel
+    NSDictionary*                                    place = nil;   // the last placement
+    std::function<std::string( const std::string& )> handler;
+    int                                              busy = 0;      // a command running now: no dialog may wait
+    KIPLATFORM::WORKBENCH::UNSAVED                   answer = KIPLATFORM::WORKBENCH::UNSAVED::CANCEL;
+    std::vector<std::string>                         asked;
+    NSTimer*                                         watch = nil;
+    Swarm                                            swarm;
+};
+
+Shared& shared()
+{
+    static Shared* mine = nullptr;
+    if( !mine )
+    {
+        NSMutableDictionary* registry = NSThread.mainThread.threadDictionary;
+        NSValue* v = registry[@"KiCadWorkbenchDock"];
+        if( !v )
+        {
+            v = [NSValue valueWithPointer:new Shared()];
+            registry[@"KiCadWorkbenchDock"] = v;
+        }
+        mine = static_cast<Shared*>( v.pointerValue );
+    }
+    return *mine;
+}
+
+#define g_dock ( shared().dock )
+#define g_place ( shared().place )
+#define g_handler ( shared().handler )
+#define g_busy ( shared().busy )
+#define g_answer ( shared().answer )
+#define g_asked ( shared().asked )
+#define g_watch ( shared().watch )
+#define S ( shared().swarm )
+
+
+void place( NSDictionary* msg );
+void swarm_start();
 
 // ---------------------------------------------------------------- connection
 
@@ -59,7 +147,20 @@ void write_line( int fd, NSDictionary* msg )
 
 void place( NSDictionary* msg )
 {
-    g_place = msg;
+    if( !msg[@"rect"] && !msg[@"visible"] && !msg[@"above"] )
+    {
+        // only the focus (the user clicked the panel): the placement stays
+    }
+    else if( msg[@"focus"] ) // remembered without it: placing again later mustn't take the focus again
+    {
+        NSMutableDictionary* m = [msg mutableCopy];
+        [m removeObjectForKey:@"focus"];
+        g_place = m;
+    }
+    else
+    {
+        g_place = msg;
+    }
     NSWindow* window = g_dock;
     if( !window )
         return;
@@ -80,10 +181,69 @@ void place( NSDictionary* msg )
     NSNumber* above = msg[@"above"];
     if( above )
         [window orderWindow:NSWindowAbove relativeTo:above.integerValue];
+    else if( !window.isVisible )
+        [window orderFront:nil];
     if( [msg[@"focus"] boolValue] )
     {
         [NSApp activateIgnoringOtherApps:YES];
         [window makeKeyWindow];
+    }
+}
+
+NSString* ns( const std::string& aText )
+{
+    return [NSString stringWithUTF8String:aText.c_str()] ?: @"";
+}
+
+// The last resort while a command runs: a modal dialog that KiCad opened anyway (not through confirm.cpp or
+// DIALOG_SHIM) is cancelled at once, and the command's reply says what it asked.
+void dismiss_modals()
+{
+    if( !g_busy )
+        return;
+    for( wxWindow* w : wxTopLevelWindows )
+    {
+        wxDialog* dlg = dynamic_cast<wxDialog*>( w );
+        // a progress dialog (loading a file) asks nothing: it goes away by itself
+        if( dlg && dlg->IsModal() && !dynamic_cast<wxGenericProgressDialog*>( dlg ) )
+        {
+            g_asked.push_back( std::string( dlg->GetTitle().ToUTF8() ) );
+            dlg->EndModal( wxID_CANCEL );
+            return;
+        }
+    }
+    // a native alert (wxMessageDialog); not a modal session of another kind (a progress dialog's, while loading)
+    NSWindow* modal = NSApp.modalWindow;
+    if( modal && [NSStringFromClass( [modal class] ) containsString:@"Alert"] )
+    {
+        std::string text = modal.title.UTF8String ?: "";
+        for( NSView* v in modal.contentView.subviews )
+            if( [v isKindOfClass:[NSTextField class]] && ( (NSTextField*) v ).stringValue.length )
+            {
+                text = ( (NSTextField*) v ).stringValue.UTF8String;
+                break;
+            }
+        g_asked.push_back( text.empty() ? std::string( "a dialog" ) : text );
+        [NSApp abortModal];
+    }
+}
+
+// Over Workbench's window again, now and once KiCad has settled: a window of its own closing (a progress dialog
+// after loading, which wxWidgets destroys later) or a frame just made (which wxWidgets orders itself) can leave the
+// docked window behind Workbench's
+void settle()
+{
+    if( !g_dock || !g_place )
+        return;
+    place( g_place );
+    NSWindow* window = g_dock;
+    for( double delay : { 0.1, 0.4, 1.0 } )
+    {
+        dispatch_after( dispatch_time( DISPATCH_TIME_NOW, int64_t( delay * NSEC_PER_SEC ) ), dispatch_get_main_queue(),
+                        ^{
+                            if( g_dock == window && g_place )
+                                place( g_place );
+                        } );
     }
 }
 
@@ -92,17 +252,54 @@ void command( int fd, NSDictionary* msg )
     id cid = msg[@"id"] ?: [NSNull null];
     NSData* data = [NSJSONSerialization dataWithJSONObject:msg options:0 error:nil];
     std::string request( static_cast<const char*>( data.bytes ), data.length );
+
+    if( g_busy++ == 0 )
+    {
+        g_answer = KIPLATFORM::WORKBENCH::UNSAVED::CANCEL;
+        g_asked.clear();
+        // in the common modes, so it fires inside a modal dialog's run loop too
+        g_watch = [NSTimer timerWithTimeInterval:0.25 repeats:YES block:^( NSTimer* ) { dismiss_modals(); }];
+        [[NSRunLoop mainRunLoop] addTimer:g_watch forMode:NSRunLoopCommonModes];
+    }
+
+    NSDictionary* reply = nil;
     try
     {
         std::string result = g_handler ? g_handler( request ) : std::string( "null" );
         NSData* rd = [NSData dataWithBytes:result.data() length:result.size()];
         id r = [NSJSONSerialization JSONObjectWithData:rd options:NSJSONReadingFragmentsAllowed error:nil];
-        write_line( fd, @{ @"id" : cid, @"ok" : @YES, @"result" : r ?: [NSNull null] } );
+        if( !g_asked.empty() && [r isKindOfClass:[NSDictionary class]] )
+        {
+            NSMutableArray* said = [NSMutableArray array];
+            for( const std::string& a : g_asked )
+                [said addObject:ns( a )];
+            NSMutableDictionary* m = [r mutableCopy];
+            m[@"kicad_said"] = said;
+            r = m;
+        }
+        reply = @{ @"id" : cid, @"ok" : @YES, @"result" : r ?: [NSNull null] };
     }
     catch( const std::exception& e )
     {
-        write_line( fd, @{ @"id" : cid, @"ok" : @NO, @"error" : [NSString stringWithUTF8String:e.what()] ?: @"failed" } );
+        std::string err = e.what();
+        if( !g_asked.empty() )
+        {
+            err += " (KiCad: ";
+            for( size_t i = 0; i < g_asked.size(); ++i )
+                err += ( i ? "; " : "" ) + g_asked[i];
+            err += ")";
+        }
+        reply = @{ @"id" : cid, @"ok" : @NO, @"error" : ns( err ) };
     }
+
+    if( --g_busy == 0 )
+    {
+        [g_watch invalidate];
+        g_watch = nil;
+        g_answer = KIPLATFORM::WORKBENCH::UNSAVED::CANCEL;
+    }
+    write_line( fd, reply );
+    settle();
 }
 
 void listen_to( std::string path, bool owner )
@@ -148,9 +345,16 @@ void listen_to( std::string path, bool owner )
             {
                 dispatch_async( dispatch_get_main_queue(), ^{
                     if( msg[@"cmd"] )
+                    {
                         command( fd, msg );
+                    }
                     else
+                    {
+                        // Workbench places it as it comes forward, before macOS has finished bringing its
+                        // window up: over it again once that's done
                         place( msg );
+                        settle();
+                    }
                 } );
             }
         }
@@ -165,54 +369,10 @@ NSWindow* window_of( wxWindow* aFrame )
 {
     if( !aFrame )
         return nil;
-    NSView* view = (__bridge NSView*) aFrame->GetHandle();
+    NSView* view = (NSView*) aFrame->GetHandle();
     return view.window;
 }
 
-// ---------------------------------------------------------------- the swarm
-
-constexpr double FLY = 0.45, DRAG = 0.55, AFTER = 0.9;
-constexpr size_t BASE = 4;
-
-struct Bot
-{
-    CALayer* layer = nil;
-    NSPoint  pos = NSZeroPoint;
-    NSPoint  from = NSZeroPoint;
-    double   free_at = 0;
-    bool     leaving = false;
-    double   press = 0;
-    long     gesture = -1;
-    NSColor* color = nil;
-};
-
-struct Gesture
-{
-    long                  id;
-    size_t                bot;
-    NSRect                rect; // overlay coords (top-left origin, flipped view)
-    double                start;
-    std::string           text;
-    bool                  click;
-    CAShapeLayer*         box = nil;
-    CATextLayer*          tag = nil;
-    std::function<void()> drawn;
-    bool                  done = false;
-};
-
-struct Swarm
-{
-    bool                 on = false;
-    NSColor*             accent = nil;
-    std::string          label;
-    std::vector<Bot>     bots;
-    std::vector<Gesture> gestures;
-    long                 next = 0;
-    double               last_hit = 0;
-    NSWindow*            overlay = nil;
-    CALayer*             root = nil;
-    NSTimer*             timer = nil;
-} S;
 
 double now()
 {
@@ -248,9 +408,15 @@ void ensure_overlay()
     S.overlay.hasShadow = NO;
     NSView* v = [[NSView alloc] initWithFrame:NSMakeRect( 0, 0, g_dock.frame.size.width, g_dock.frame.size.height )];
     v.wantsLayer = YES;
-    v.layer.geometryFlipped = YES; // top-left origin, like the rectangles KiCad hands us
     S.overlay.contentView = v;
-    S.root = v.layer;
+    // the robots' own layer, top-left origin like the rectangles KiCad hands us (AppKit manages the view's layer and
+    // its flip; a sublayer's is ours)
+    CALayer* root = [CALayer layer];
+    root.geometryFlipped = YES;
+    root.anchorPoint = CGPointZero;
+    root.frame = v.layer.bounds;
+    [v.layer addSublayer:root];
+    S.root = root;
     [g_dock addChildWindow:S.overlay ordered:NSWindowAbove];
 }
 
@@ -262,6 +428,8 @@ void follow_dock()
                                             ? [g_dock convertRectToScreen:g_dock.contentLayoutRect]
                                             : g_dock.frame ) )
         [S.overlay setFrame:[g_dock convertRectToScreen:g_dock.contentLayoutRect] display:NO];
+    if( S.root && !CGSizeEqualToSize( S.root.bounds.size, S.overlay.contentView.bounds.size ) )
+        S.root.frame = S.overlay.contentView.bounds;
     if( S.overlay.parentWindow != g_dock )
     {
         [S.overlay.parentWindow removeChildWindow:S.overlay];
@@ -505,10 +673,46 @@ void tick()
 }
 } // namespace
 
+namespace
+{
+void swarm_start()
+{
+    ensure_overlay();
+    follow_dock();
+    if( !S.root )
+        return; // no docked window yet: SetDockedWindow starts it
+    while( S.bots.size() < BASE )
+        add_bot();
+    ensure_timer();
+}
+} // namespace
+
 namespace KIPLATFORM
 {
 namespace WORKBENCH
 {
+bool Busy()
+{
+    return g_busy > 0;
+}
+
+UNSAVED UnsavedAnswer()
+{
+    return g_busy > 0 ? g_answer : UNSAVED::ASK;
+}
+
+void SetUnsavedAnswer( UNSAVED aAnswer )
+{
+    if( g_busy > 0 )
+        g_answer = aAnswer;
+}
+
+void Asked( const std::string& aMessage )
+{
+    if( g_busy > 0 )
+        g_asked.push_back( aMessage );
+}
+
 bool Docked()
 {
     const char* p = getenv( "WORKBENCH_DOCK" );
@@ -530,6 +734,12 @@ void Start( std::function<std::string( const std::string& )> aHandler )
     g_handler = std::move( aHandler );
     NSApp.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    // any window of KiCad's closing (a dialog, a progress window) can take the docked one behind Workbench's
+    [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowWillCloseNotification object:nil queue:nil
+                                                  usingBlock:^( NSNotification* note ) {
+                                                      if( note.object != g_dock && note.object != S.overlay )
+                                                          settle();
+                                                  }];
     std::thread( listen_to, std::string( getenv( "WORKBENCH_DOCK" ) ), true ).detach();
     if( const char* control = getenv( "WORKBENCH_CONTROL" ); control && control[0] )
         std::thread( listen_to, std::string( control ), false ).detach();
@@ -540,8 +750,14 @@ void SetDockedWindow( wxWindow* aFrame )
     if( !Docked() )
         return;
     NSWindow* window = window_of( aFrame );
-    if( !window || window == g_dock )
+    if( !window )
         return;
+    if( window == g_dock )
+    {
+        if( g_place )
+            place( g_place ); // over Workbench's window again
+        return;
+    }
     if( g_dock )
     {
         if( S.overlay )
@@ -557,12 +773,18 @@ void SetDockedWindow( wxWindow* aFrame )
         [window standardWindowButton:b].hidden = YES;
     window.hasShadow = NO;
     window.movable = NO;
+    // with Workbench wherever it is (its own Space, full screen)
+    window.collectionBehavior |= NSWindowCollectionBehaviorMoveToActiveSpace
+                                 | NSWindowCollectionBehaviorFullScreenAuxiliary;
     if( S.overlay )
         [g_dock addChildWindow:S.overlay ordered:NSWindowAbove];
+    if( S.on )
+        swarm_start(); // the swarm turned on before there was a window to put it over
     if( g_place )
         place( g_place );
     else
         [window setFrameOrigin:NSMakePoint( -30000, -30000 )];
+    settle();
 }
 
 void HideWindow( wxWindow* aFrame )
@@ -583,13 +805,7 @@ void SwarmSet( bool aOn, const std::string& aAccent )
     S.on = aOn;
     if( aOn )
     {
-        ensure_overlay();
-        follow_dock();
-        if( !S.root )
-            return;
-        while( S.bots.size() < BASE )
-            add_bot();
-        ensure_timer();
+        swarm_start();
     }
     else
     {
@@ -616,7 +832,7 @@ void SwarmLabel( const std::string& aText )
 
 void SwarmTarget( double aX, double aY, double aW, double aH, std::function<void()> aOnDrawn )
 {
-    if( !S.on || !S.root || aW < 3 || aH < 3 )
+    if( !S.on || !S.root || aW < 1 || aH < 1 )
     {
         if( aOnDrawn )
             aOnDrawn();
