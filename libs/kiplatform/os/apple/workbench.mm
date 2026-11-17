@@ -44,7 +44,7 @@ namespace
 {
 // ---------------------------------------------------------------- the swarm
 
-constexpr double FLY = 0.45, DRAG = 0.55, AFTER = 0.9;
+constexpr double FLY = 0.6, DRAG = 0.9, AFTER = 0.9;
 constexpr size_t BASE = 4;
 
 struct Bot
@@ -71,7 +71,12 @@ struct Gesture
     CATextLayer*          tag = nil;
     std::function<void()> drawn;
     bool                  done = false;
+    std::function<int( double&, double&, double&, double& )> where;   // where it is now (KIPLATFORM::WORKBENCH::SWARM_WHERE)
+    bool                  off = false;   // out of view: worked at the view's edge, an arrow toward it
+    NSPoint               dir = NSZeroPoint;
+    NSSize                tagSize = NSZeroSize;
 };
+
 
 struct Swarm
 {
@@ -514,6 +519,30 @@ void add_bot()
     S.bots.push_back( b );
 }
 
+// a gesture's place now: it follows its item (zoom, pan, resize); out of view, a spot at the edge toward it
+void follow( Gesture& g )
+{
+    if( !g.where )
+        return;
+    double x = 0, y = 0, w = 0, h = 0;
+    const int r = g.where( x, y, w, h );
+    if( r == 1 )
+    {
+        g.rect = NSMakeRect( x, y, w, h );
+        g.off = false;
+        g.click = w < 40 && h < 30;
+    }
+    else if( r == 2 )
+    {
+        g.rect = NSMakeRect( x - 10, y - 10, 20, 20 );
+        g.off = true;
+        g.click = true;
+        const NSSize sz = S.overlay ? S.overlay.frame.size : NSMakeSize( 800, 600 );
+        const double dx = x - sz.width / 2, dy = y - sz.height / 2, n = std::hypot( dx, dy );
+        g.dir = n > 0 ? NSMakePoint( dx / n, dy / n ) : NSMakePoint( 1, 0 );
+    }
+}
+
 void tick()
 {
     if( !S.root )
@@ -527,6 +556,7 @@ void tick()
     for( auto it = S.gestures.begin(); it != S.gestures.end(); )
     {
         Gesture& g = *it;
+        follow( g );
         const double k = ease( ( t - g.start - FLY ) / DRAG );
         const double fade = 1 - std::clamp( ( t - g.start - FLY - DRAG ) / AFTER, 0.0, 1.0 );
         if( !g.done && t >= g.start + FLY + DRAG )
@@ -551,7 +581,22 @@ void tick()
                 g.box.lineWidth = 1.2;
                 [S.root insertSublayer:g.box atIndex:0];
             }
-            if( g.click )
+            if( g.off )
+            {
+                // an arrow at the view's edge, pointing at the work out of view
+                const NSPoint c = NSMakePoint( NSMidX( g.rect ) + g.dir.x * 6, NSMidY( g.rect ) + g.dir.y * 6 );
+                const NSPoint s = NSMakePoint( -g.dir.y * 8, g.dir.x * 8 );
+                CGMutablePathRef p = CGPathCreateMutable();
+                CGPathMoveToPoint( p, nullptr, c.x + g.dir.x * 14, c.y + g.dir.y * 14 );
+                CGPathAddLineToPoint( p, nullptr, c.x + s.x, c.y + s.y );
+                CGPathAddLineToPoint( p, nullptr, c.x - s.x, c.y - s.y );
+                CGPathCloseSubpath( p );
+                g.box.path = p;
+                CGPathRelease( p );
+                g.box.fillColor = [acc colorWithAlphaComponent:0.95 * fade].CGColor;
+                g.box.strokeColor = NSColor.clearColor.CGColor;
+            }
+            else if( g.click )
             {
                 const double r = 6 + 16 * k;
                 const NSPoint c = NSMakePoint( NSMidX( g.rect ), NSMidY( g.rect ) );
@@ -585,10 +630,14 @@ void tick()
                     const NSSize ts = [g.tag.string sizeWithAttributes:@{
                         NSFontAttributeName : [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightMedium]
                     }];
-                    g.tag.frame = CGRectMake( g.rect.origin.x, g.rect.origin.y - ts.height - 6, ts.width + 10,
-                                              ts.height + 4 );
+                    g.tagSize = NSMakeSize( ts.width + 10, ts.height + 4 );
                     [S.root addSublayer:g.tag];
                 }
+                // over its work, kept inside the view (work at the edge)
+                const NSSize sz = S.overlay.frame.size;
+                const double tx = std::clamp( g.rect.origin.x, 0.0, std::max( 0.0, sz.width - g.tagSize.width ) );
+                const double ty = std::clamp( g.rect.origin.y - g.tagSize.height - 2, 0.0, std::max( 0.0, sz.height - g.tagSize.height ) );
+                g.tag.frame = CGRectMake( tx, ty, g.tagSize.width, g.tagSize.height );
                 g.tag.backgroundColor = [acc colorWithAlphaComponent:0.95 * fade].CGColor;
                 g.tag.opacity = fade;
             }
@@ -828,6 +877,31 @@ bool SwarmOn()
 void SwarmLabel( const std::string& aText )
 {
     S.label = aText;
+}
+
+void SwarmTargetLive( SWARM_WHERE aWhere, std::function<void()> aOnDrawn )
+{
+    double x = 0, y = 0, w = 0, h = 0;
+    const int r = aWhere ? aWhere( x, y, w, h ) : 0;
+    if( r == 0 )
+    {
+        if( aOnDrawn )
+            aOnDrawn();
+        return;
+    }
+    if( r == 2 )
+    {
+        x -= 10;
+        y -= 10;
+        w = h = 20;
+    }
+    const size_t before = S.gestures.size();
+    SwarmTarget( x, y, w, h, std::move( aOnDrawn ) );
+    if( S.gestures.size() > before )
+    {
+        S.gestures.back().where = std::move( aWhere );
+        follow( S.gestures.back() );
+    }
 }
 
 void SwarmTarget( double aX, double aY, double aW, double aH, std::function<void()> aOnDrawn )

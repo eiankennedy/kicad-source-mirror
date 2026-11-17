@@ -86,6 +86,11 @@ namespace WORKBENCH
     /// aOnDrawn runs on the main thread once the robot has drawn it (a new item shown then), or right away when
     /// the swarm is off.
     void SwarmTarget( double aX, double aY, double aW, double aH, std::function<void()> aOnDrawn = nullptr );
+    /// Where a change is on screen now, asked every frame while its robot works (so it follows the item through
+    /// zooms, pans and resizes): 1 in view (x, y, w, h as for SwarmTarget), 2 out of view (x, y: the point at the
+    /// view's edge toward it; its robot works there, with an arrow), 0 gone (the last place stays).
+    using SWARM_WHERE = std::function<int( double& aX, double& aY, double& aW, double& aH )>;
+    void SwarmTargetLive( SWARM_WHERE aWhere, std::function<void()> aOnDrawn = nullptr );
 } // namespace WORKBENCH
 } // namespace KIPLATFORM
 
