@@ -23,6 +23,18 @@
 // and from reloading the file from disk after Claude edits it (compared item by item).
 
 #include <kiplatform/workbench.h>
+#include <geometry/shape_arc.h>
+#include <geometry/shape_line_chain.h>
+#include <lib_symbol.h>
+#include <sch_field.h>
+#include <sch_label.h>
+#include <sch_line.h>
+#include <sch_pin.h>
+#include <sch_shape.h>
+#include <sch_sheet.h>
+#include <sch_symbol.h>
+#include <sch_text.h>
+#include <set>
 #include <kiway_player.h>
 #include <sch_edit_frame.h>
 #include <sch_item.h>
@@ -160,37 +172,468 @@ bool on_sheet_shown( SCH_EDIT_FRAME* aFrame, SCH_ITEM* aItem )
     return screen && aItem && aItem->GetParent() && screen->Items().contains( aItem );
 }
 
-void act_out( SCH_EDIT_FRAME* aFrame, SCH_ITEM* aItem, bool aNew )
+// ---------------------------------------------------------------- the build plan
+
+using PIECE = KIPLATFORM::WORKBENCH::SWARM_PIECE;
+using PT = KIPLATFORM::WORKBENCH::SWARM_PT;
+
+// what the swarm keeps out of sight until its robot has made it (a reload makes the sheet again: hidden again then)
+std::set<KIID> g_pending;
+
+// the sheet's world (internal units) to the overlay (points, from the docked window's content top-left), this frame
+KIPLATFORM::WORKBENCH::SWARM_VIEW view_map( SCH_EDIT_FRAME* aFrame )
 {
-    if( !KIPLATFORM::WORKBENCH::SwarmOn() || !on_sheet_shown( aFrame, aItem ) )
-        return;
-
-    KIGFX::VIEW* view = aFrame->GetCanvas()->GetView();
-    const KIID   id = aItem->m_Uuid;
-    // asked every frame while its robot works: the robot follows the item when the view is zoomed, panned or resized
-    KIPLATFORM::WORKBENCH::SWARM_WHERE where = [aFrame, id]( double& x, double& y, double& w, double& h ) -> int
+    return [aFrame]( double* m ) -> bool
     {
-        SCH_ITEM* item = aFrame->Schematic().ResolveItem( id, nullptr, true );
-        return item ? where_box( aFrame, item->GetBoundingBox(), x, y, w, h ) : 0;
-    };
-    double x, y, w, h;
+        EDA_DRAW_PANEL_GAL* canvas = aFrame->GetCanvas();
 
-    if( !where( x, y, w, h ) )
+        if( !canvas || !canvas->GetView() )
+            return false;
+
+        KIGFX::VIEW*   view = canvas->GetView();
+        const wxSize   client = canvas->GetClientSize();
+        const VECTOR2I px = view->GetScreenPixelSize();
+        const double   scale = client.x > 0 ? double( px.x ) / client.x : 1.0;
+        const wxPoint  origin = canvas->ClientToScreen( wxPoint( 0, 0 ) ) - aFrame->ClientToScreen( wxPoint( 0, 0 ) );
+        const VECTOR2D o = view->ToScreen( VECTOR2D( 0, 0 ) );
+        const VECTOR2D ex = view->ToScreen( VECTOR2D( 1e5, 0 ) ) - o;
+        const VECTOR2D ey = view->ToScreen( VECTOR2D( 0, 1e5 ) ) - o;
+        m[0] = ex.x / 1e5 / scale;
+        m[1] = ey.x / 1e5 / scale;
+        m[2] = origin.x + o.x / scale;
+        m[3] = ex.y / 1e5 / scale;
+        m[4] = ey.y / 1e5 / scale;
+        m[5] = origin.y + o.y / scale;
+        return true;
+    };
+}
+
+void hide( KIGFX::VIEW* aView, SCH_ITEM* aItem )
+{
+    aView->Hide( aItem, true );
+    g_pending.insert( aItem->m_Uuid );
+}
+
+void reveal( SCH_EDIT_FRAME* aFrame, const KIID& aId )
+{
+    g_pending.erase( aId );
+
+    if( SCH_ITEM* item = aFrame->Schematic().ResolveItem( aId, nullptr, true ) )
+    {
+        aFrame->GetCanvas()->GetView()->Hide( item, false );
+        aFrame->GetCanvas()->Refresh();
+    }
+}
+
+// after a reload (the sheet made again from the file): what the robots haven't made yet stays out of sight
+void hide_pending( SCH_EDIT_FRAME* aFrame )
+{
+    for( auto it = g_pending.begin(); it != g_pending.end(); )
+    {
+        if( SCH_ITEM* item = aFrame->Schematic().ResolveItem( *it, nullptr, true ) )
+        {
+            aFrame->GetCanvas()->GetView()->Hide( item, true );
+            ++it;
+        }
+        else
+        {
+            it = g_pending.erase( it );
+        }
+    }
+}
+
+const PT LIFT{ NAN, NAN };
+
+PT pt( const VECTOR2I& p )
+{
+    return PT{ double( p.x ), double( p.y ) };
+}
+
+void box_points( const BOX2I& b, std::vector<PT>& out )
+{
+    out.push_back( PT{ double( b.GetLeft() ), double( b.GetTop() ) } );
+    out.push_back( PT{ double( b.GetRight() ), double( b.GetTop() ) } );
+    out.push_back( PT{ double( b.GetRight() ), double( b.GetBottom() ) } );
+    out.push_back( PT{ double( b.GetLeft() ), double( b.GetBottom() ) } );
+    out.push_back( PT{ double( b.GetLeft() ), double( b.GetTop() ) } );
+}
+
+// a library shape's line as points (one stroke, or several with lifts), placed by the symbol's transform
+void shape_points( const EDA_SHAPE& s, const std::function<VECTOR2I( const VECTOR2I& )>& at, std::vector<PT>& out )
+{
+    auto put = [&]( const VECTOR2I& p ) { out.push_back( pt( at( p ) ) ); };
+
+    switch( s.GetShape() )
+    {
+    case SHAPE_T::SEGMENT:
+        put( s.GetStart() );
+        put( s.GetEnd() );
+        break;
+    case SHAPE_T::RECTANGLE:
+    {
+        const std::vector<VECTOR2I> c = s.GetRectCorners();
+        for( const VECTOR2I& p : c )
+            put( p );
+        if( !c.empty() )
+            put( c.front() );
+        break;
+    }
+    case SHAPE_T::CIRCLE:
+    {
+        const VECTOR2I c = s.GetStart();   // a circle: its centre
+        const double   r = s.GetRadius();
+        for( int i = 0; i <= 20; ++i )
+            put( VECTOR2I( KiROUND( c.x + r * std::cos( i * M_PI / 10 ) ), KiROUND( c.y + r * std::sin( i * M_PI / 10 ) ) ) );
+        break;
+    }
+    case SHAPE_T::ARC:
+    {
+        const SHAPE_LINE_CHAIN ch = SHAPE_ARC( s.GetStart(), s.GetArcMid(), s.GetEnd(), 0 ).ConvertToPolyline( 2000 );
+        for( int i = 0; i < ch.PointCount(); ++i )
+            put( ch.CPoint( i ) );
+        break;
+    }
+    case SHAPE_T::POLY:
+    {
+        const SHAPE_POLY_SET& ps = s.GetPolyShape();
+        for( int o = 0; o < ps.OutlineCount(); ++o )
+        {
+            if( o > 0 )
+                out.push_back( LIFT );
+            const SHAPE_LINE_CHAIN& ch = ps.COutline( o );
+            for( int i = 0; i < ch.PointCount(); ++i )
+                put( ch.CPoint( i ) );
+            if( ch.IsClosed() && ch.PointCount() )
+                put( ch.CPoint( 0 ) );
+        }
+        break;
+    }
+    case SHAPE_T::BEZIER:
+        for( const VECTOR2I& p : s.GetBezierPoints() )
+            put( p );
+        break;
+    default: break;
+    }
+}
+
+int add( std::vector<PIECE>& aPieces, PIECE aPiece )
+{
+    aPieces.push_back( std::move( aPiece ) );
+    return int( aPieces.size() ) - 1;
+}
+
+PIECE type_text( SCH_EDIT_FRAME* aFrame, const wxString& aText, int aHeight, const BOX2I& aBox, std::vector<int> aAfter,
+                 const KIID* aReveal, unsigned aColor = 0 )
+{
+    PIECE p;
+    p.kind = PIECE::TYPE;
+    p.text = std::string( aText.ToUTF8() );
+    p.size = aHeight;
+    p.pts.push_back( PT{ double( aBox.GetLeft() ), double( aBox.GetTop() ) } );
+    p.after = std::move( aAfter );
+    p.color = aColor;
+
+    if( aReveal )
+    {
+        const KIID id = *aReveal;
+        p.done = [aFrame, id]() { reveal( aFrame, id ); };
+    }
+
+    return p;
+}
+
+// a symbol: its body outline traced, then its pins one by one, then its reference and value typed, then it shows
+int plan_symbol( SCH_EDIT_FRAME* aFrame, std::vector<PIECE>& aPieces, SCH_SYMBOL* aSym, const std::vector<int>& aAfter )
+{
+    const int        hold = -2;   // patched below: the drawing stays until the symbol shows
+    const TRANSFORM& t = aSym->GetTransform();
+    const VECTOR2I   pos = aSym->GetPosition();
+    auto             at = [&]( const VECTOR2I& p ) { return t.TransformCoordinate( p ) + pos; };
+    std::vector<int> body;
+    std::vector<PT>  strokes;
+    int              shapes = 0;
+
+    if( const std::unique_ptr<LIB_SYMBOL>& lib = aSym->GetLibSymbolRef() )
+    {
+        for( const SCH_ITEM& item : lib->GetDrawItems()[SCH_SHAPE_T] )
+        {
+            if( item.GetUnit() && item.GetUnit() != aSym->GetUnit() )
+                continue;
+            if( item.GetBodyStyle() && item.GetBodyStyle() != aSym->GetBodyStyle() )
+                continue;
+
+            if( !strokes.empty() )
+                strokes.push_back( LIFT );
+
+            shape_points( static_cast<const SCH_SHAPE&>( item ), at, strokes );
+            ++shapes;
+        }
+    }
+
+    if( strokes.empty() )
+        box_points( aSym->GetBodyBoundingBox(), strokes );
+
+    {
+        PIECE p;
+        p.kind = PIECE::TRACE;
+        p.pts = std::move( strokes );
+        p.after = aAfter;
+        p.hold = hold;
+        p.tag = "place " + std::string( aSym->GetRef( &aFrame->GetCurrentSheet() ).ToUTF8() );
+        body.push_back( add( aPieces, std::move( p ) ) );
+    }
+
+    // pins, each from the body out to where a wire meets it
+    std::vector<int> made = body;
+    std::vector<SCH_PIN*> pins = aSym->GetPins( &aFrame->GetCurrentSheet() );
+
+    if( !pins.empty() )
+    {
+        PIECE p;
+        p.kind = PIECE::TRACE;
+        p.after = body;
+        p.hold = hold;
+
+        for( SCH_PIN* pin : pins )
+        {
+            if( !pin->IsVisible() )
+                continue;
+            if( !p.pts.empty() )
+                p.pts.push_back( LIFT );
+            p.pts.push_back( pt( pin->GetPinRoot() ) );
+            p.pts.push_back( pt( pin->GetPosition() ) );
+        }
+
+        if( !p.pts.empty() )
+            made = { add( aPieces, std::move( p ) ) };
+    }
+
+    std::vector<int> fields;
+
+    for( const SCH_FIELD& f : aSym->GetFields() )
+    {
+        if( !f.IsVisible() || ( f.GetId() != FIELD_T::REFERENCE && f.GetId() != FIELD_T::VALUE ) )
+            continue;
+
+        const wxString text = f.GetShownText( &aFrame->GetCurrentSheet(), false );
+
+        if( text.IsEmpty() )
+            continue;
+
+        PIECE p = type_text( aFrame, text, f.GetTextHeight(), f.GetBoundingBox(), made, nullptr );
+        p.hold = hold;
+        fields.push_back( add( aPieces, std::move( p ) ) );
+    }
+
+    // the click that makes it real
+    PIECE fin;
+    fin.kind = PIECE::STAMP;
+    const double r = std::max( 2000.0, std::min( aSym->GetBodyBoundingBox().GetWidth(), aSym->GetBodyBoundingBox().GetHeight() ) * 0.06 );
+    const VECTOR2I c = aSym->GetBodyBoundingBox().Centre();
+    fin.pts = { PT{ c.x - r, c.y - r }, PT{ c.x + r, c.y + r } };
+    fin.round = { 1 };
+    fin.after = made;
+    fin.after.insert( fin.after.end(), fields.begin(), fields.end() );
+    fin.after.insert( fin.after.end(), body.begin(), body.end() );
+    const KIID id = aSym->m_Uuid;
+    fin.done = [aFrame, id]() { reveal( aFrame, id ); };
+    const int f = add( aPieces, std::move( fin ) );
+
+    for( PIECE& p : aPieces )
+        if( p.hold == hold )
+            p.hold = f;
+
+    (void) shapes;
+    return f;
+}
+
+// the changes from a reload or the schematic's listeners, as one plan: sheets and symbols first (several at once),
+// then the wires traced segment by segment, then junctions, no-connects and labels; a changed item gets a box
+void act_out( SCH_EDIT_FRAME* aFrame, const std::vector<std::pair<SCH_ITEM*, bool>>& aWork )
+{
+    if( !KIPLATFORM::WORKBENCH::SwarmOn() || aWork.empty() )
         return;
 
-    // new or changed, it's shown (where it now is) once its robot has drawn it out
-    view->Hide( aItem, true );
-    (void) aNew;
+    KIGFX::VIEW*            view = aFrame->GetCanvas()->GetView();
+    std::vector<PIECE>      pieces;
+    std::vector<SCH_SYMBOL*> syms;
+    std::vector<SCH_SHEET*> sheets;
+    std::vector<SCH_LINE*>  lines;
+    std::vector<SCH_ITEM*>  dots, texts, other;
+    std::set<SCH_ITEM*>     seen;
 
-    KIPLATFORM::WORKBENCH::SwarmTargetLive( where,
-            [aFrame, id]()
+    for( const auto& [item, isNew] : aWork )
+    {
+        if( !item || !on_sheet_shown( aFrame, item ) || !seen.insert( item ).second || g_pending.count( item->m_Uuid ) )
+            continue;
+
+        if( !isNew )
+        {
+            // changed: a robot drags a box over it, where it now is; it shows as it is then
+            const KIID id = item->m_Uuid;
+            hide( view, item );
+            KIPLATFORM::WORKBENCH::SwarmTargetLive(
+                    [aFrame, id]( double& x, double& y, double& w, double& h ) -> int
+                    {
+                        SCH_ITEM* it = aFrame->Schematic().ResolveItem( id, nullptr, true );
+                        return it ? where_box( aFrame, it->GetBoundingBox(), x, y, w, h ) : 0;
+                    },
+                    [aFrame, id]() { reveal( aFrame, id ); } );
+            continue;
+        }
+
+        hide( view, item );
+
+        switch( item->Type() )
+        {
+        case SCH_SYMBOL_T: syms.push_back( static_cast<SCH_SYMBOL*>( item ) ); break;
+        case SCH_SHEET_T: sheets.push_back( static_cast<SCH_SHEET*>( item ) ); break;
+        case SCH_LINE_T: lines.push_back( static_cast<SCH_LINE*>( item ) ); break;
+        case SCH_JUNCTION_T:
+        case SCH_NO_CONNECT_T: dots.push_back( item ); break;
+        case SCH_LABEL_T:
+        case SCH_GLOBAL_LABEL_T:
+        case SCH_HIER_LABEL_T:
+        case SCH_DIRECTIVE_LABEL_T:
+        case SCH_TEXT_T: texts.push_back( item ); break;
+        default: other.push_back( item ); break;
+        }
+    }
+
+    std::vector<int> placed;
+
+    for( SCH_SHEET* sh : sheets )
+    {
+        PIECE p;
+        p.kind = PIECE::TRACE;
+        box_points( BOX2I( sh->GetPosition(), sh->GetSize() ), p.pts );
+        p.tag = "sheet";
+        const KIID id = sh->m_Uuid;
+        p.done = [aFrame, id]() { reveal( aFrame, id ); };
+        placed.push_back( add( pieces, std::move( p ) ) );
+    }
+
+    std::sort( syms.begin(), syms.end(), []( SCH_SYMBOL* a, SCH_SYMBOL* b ) { return a->GetPosition().x < b->GetPosition().x; } );
+
+    for( SCH_SYMBOL* sym : syms )
+        placed.push_back( plan_symbol( aFrame, pieces, sym, {} ) );
+
+    // wires walked into runs (segments meeting end to end), each traced segment by segment
+    std::vector<bool> used( lines.size(), false );
+    std::vector<int>  wired = placed;
+    bool              first = true;
+
+    for( size_t i = 0; i < lines.size(); ++i )
+    {
+        if( used[i] )
+            continue;
+
+        used[i] = true;
+        std::vector<SCH_LINE*> run{ lines[i] };
+        std::vector<VECTOR2I>  pts{ lines[i]->GetStartPoint(), lines[i]->GetEndPoint() };
+
+        for( bool grew = true; grew && run.size() < 40; )
+        {
+            grew = false;
+
+            for( size_t j = 0; j < lines.size(); ++j )
             {
-                if( SCH_ITEM* item = aFrame->Schematic().ResolveItem( id, nullptr, true ) )
+                if( used[j] || lines[j]->GetLayer() != lines[i]->GetLayer() )
+                    continue;
+
+                if( lines[j]->GetStartPoint() == pts.back() || lines[j]->GetEndPoint() == pts.back() )
                 {
-                    aFrame->GetCanvas()->GetView()->Hide( item, false );
-                    aFrame->GetCanvas()->Refresh();
+                    used[j] = true;
+                    run.push_back( lines[j] );
+                    pts.push_back( lines[j]->GetStartPoint() == pts.back() ? lines[j]->GetEndPoint() : lines[j]->GetStartPoint() );
+                    grew = true;
+                    break;
                 }
-            } );
+            }
+        }
+
+        PIECE             p;
+        std::vector<KIID> ids;
+        p.kind = PIECE::TRACE;
+        p.after = placed;
+        p.color = lines[i]->IsBus() ? 0x2F80ED : lines[i]->IsWire() ? 0x4CAF50 : 0;
+        p.width = lines[i]->GetPenWidth();
+        p.tag = first ? std::string( "wire" ) : std::string();
+        first = false;
+
+        for( const VECTOR2I& q : pts )
+            p.pts.push_back( pt( q ) );
+
+        for( SCH_LINE* l : run )
+            ids.push_back( l->m_Uuid );
+
+        p.step = [aFrame, ids]( int k )
+        {
+            if( k >= 0 && k < (int) ids.size() )
+                reveal( aFrame, ids[k] );
+        };
+        wired.push_back( add( pieces, std::move( p ) ) );
+    }
+
+    std::sort( dots.begin(), dots.end(), []( SCH_ITEM* a, SCH_ITEM* b ) { return a->GetPosition().x < b->GetPosition().x; } );
+
+    for( size_t i = 0; i < dots.size(); i += 6 )
+    {
+        PIECE             p;
+        std::vector<KIID> ids;
+        p.kind = PIECE::STAMP;
+        p.after = wired;
+        p.color = 0x4CAF50;
+
+        for( size_t k = i; k < std::min( dots.size(), i + 6 ); ++k )
+        {
+            const BOX2I b = dots[k]->GetBoundingBox();
+            p.pts.push_back( PT{ double( b.GetLeft() ), double( b.GetTop() ) } );
+            p.pts.push_back( PT{ double( b.GetRight() ), double( b.GetBottom() ) } );
+            p.round.push_back( dots[k]->Type() == SCH_JUNCTION_T ? 1 : 0 );
+            ids.push_back( dots[k]->m_Uuid );
+        }
+
+        p.step = [aFrame, ids]( int k )
+        {
+            if( k >= 0 && k < (int) ids.size() )
+                reveal( aFrame, ids[k] );
+        };
+        add( pieces, std::move( p ) );
+    }
+
+    for( SCH_ITEM* item : texts )
+    {
+        const SCH_TEXT* t = dynamic_cast<const SCH_TEXT*>( item );
+        const KIID      id = item->m_Uuid;
+
+        if( t )
+        {
+            PIECE p = type_text( aFrame, t->GetShownText( &aFrame->GetCurrentSheet(), false ), t->GetTextHeight(),
+                                 item->GetBoundingBox(), wired, &id );
+            add( pieces, std::move( p ) );
+        }
+        else
+        {
+            other.push_back( item );
+        }
+    }
+
+    for( SCH_ITEM* item : other )
+    {
+        PIECE p;
+        p.kind = PIECE::TRACE;
+        box_points( item->GetBoundingBox(), p.pts );
+        p.after = placed;
+        const KIID id = item->m_Uuid;
+        p.done = [aFrame, id]() { reveal( aFrame, id ); };
+        add( pieces, std::move( p ) );
+    }
+
+    if( !pieces.empty() )
+        KIPLATFORM::WORKBENCH::SwarmPlan( std::move( pieces ), view_map( aFrame ) );
+
+    aFrame->GetCanvas()->Refresh();
 }
 
 class WORKBENCH_SCH_LISTENER : public SCHEMATIC_LISTENER
@@ -200,18 +643,18 @@ public:
 
     void SetFrame( SCH_EDIT_FRAME* aFrame ) { m_frame = aFrame; }   // a frame made again (after another project opened)
 
-    void OnSchItemsAdded( SCHEMATIC&, std::vector<SCH_ITEM*>& aItems ) override
-    {
-        for( SCH_ITEM* item : aItems )
-            act_out( m_frame, item, true );
-    }
-    void OnSchItemsChanged( SCHEMATIC&, std::vector<SCH_ITEM*>& aItems ) override
-    {
-        for( SCH_ITEM* item : aItems )
-            act_out( m_frame, item, false );
-    }
+    void OnSchItemsAdded( SCHEMATIC&, std::vector<SCH_ITEM*>& aItems ) override { act_out( m_frame, batch( aItems, true ) ); }
+    void OnSchItemsChanged( SCHEMATIC&, std::vector<SCH_ITEM*>& aItems ) override { act_out( m_frame, batch( aItems, false ) ); }
 
 private:
+    static std::vector<std::pair<SCH_ITEM*, bool>> batch( std::vector<SCH_ITEM*>& aItems, bool aNew )
+    {
+        std::vector<std::pair<SCH_ITEM*, bool>> out;
+        for( SCH_ITEM* item : aItems )
+            out.emplace_back( item, aNew );
+        return out;
+    }
+
     SCH_EDIT_FRAME* m_frame;
 };
 
@@ -381,17 +824,38 @@ void WorkbenchSchMail( SCH_EDIT_FRAME* aFrame, std::string& aPayload )
                 }
             }
 
-            // the robots act it out where it can be seen: the whole sheet in view when some of it is outside
+            // the robots act it out where it can be seen: the view goes to the new work when it's outside the
+            // view or small in it (the work about two thirds of the view; the sheet's frame isn't what's being built)
             if( !work.empty() && KIPLATFORM::WORKBENCH::SwarmOn() && !userView )
             {
-                const BOX2D view = aFrame->GetCanvas()->GetView()->GetViewport();
+                KIGFX::VIEW* v = aFrame->GetCanvas()->GetView();
+                const BOX2D  view = v->GetViewport();
+                const BOX2D  w( VECTOR2D( where.GetOrigin() ), VECTOR2D( where.GetSize() ) );
+                const double fill = std::max( w.GetWidth() / view.GetWidth(), w.GetHeight() / view.GetHeight() );
 
-                if( !view.Contains( BOX2D( VECTOR2D( where.GetOrigin() ), VECTOR2D( where.GetSize() ) ) ) )
-                    aFrame->GetToolManager()->RunAction( ACTIONS::zoomFitScreen );
+                if( !view.Contains( w ) || fill < 0.35 )
+                {
+                    double       wd = std::max( w.GetWidth() * 1.5, 300000.0 );
+                    double       ht = std::max( w.GetHeight() * 1.5, 300000.0 * 0.6 );
+                    const double aspect = view.GetHeight() > 0 ? view.GetWidth() / view.GetHeight() : 1.0;
+
+                    if( wd / ht < aspect )
+                        wd = ht * aspect;
+                    else
+                        ht = wd / aspect;
+
+                    v->SetViewport( BOX2D( w.Centre() - VECTOR2D( wd / 2, ht / 2 ), VECTOR2D( wd, ht ) ) );
+                    aFrame->GetCanvas()->Refresh();
+                }
             }
 
+            hide_pending( aFrame );
+            std::vector<std::pair<SCH_ITEM*, bool>> items;
+
             for( const auto& [id, isNew] : work )
-                act_out( aFrame, aFrame->Schematic().ResolveItem( id, nullptr, true ), isNew );
+                items.emplace_back( aFrame->Schematic().ResolveItem( id, nullptr, true ), isNew );
+
+            act_out( aFrame, items );
 
             if( !userView )
                 mark_view( aFrame );   // the view as Workbench left it

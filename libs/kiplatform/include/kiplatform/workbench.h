@@ -22,6 +22,7 @@
 
 #include <functional>
 #include <string>
+#include <vector>
 
 class wxWindow;
 
@@ -91,6 +92,44 @@ namespace WORKBENCH
     /// view's edge toward it; its robot works there, with an arrow), 0 gone (the last place stays).
     using SWARM_WHERE = std::function<int( double& aX, double& aY, double& aW, double& aH )>;
     void SwarmTargetLive( SWARM_WHERE aWhere, std::function<void()> aOnDrawn = nullptr );
+
+    /// A point in the editor's own world (its internal units).
+    struct SWARM_PT
+    {
+        double x = 0, y = 0;
+    };
+
+    /// One piece of a plan: a robot's job, the way the browser swarm rebuilds a page piece by piece.
+    struct SWARM_PIECE
+    {
+        enum KIND
+        {
+            TRACE,   ///< a pen along pts (a NaN point lifts the pen between strokes): an outline, a pin, a wire, a track
+            STAMP,   ///< shapes put down one after another, two corners each in pts: pads, vias, junctions
+            TYPE,    ///< text typed in from pts[0] (its top-left): a reference, a value, a label
+            BOX      ///< a box dragged over an item (a change)
+        };
+        KIND                  kind = TRACE;
+        std::vector<SWARM_PT> pts;
+        std::vector<char>     round;       ///< STAMP: per shape, a circle (else a rounded rectangle)
+        double                width = 0;   ///< TRACE: the stroke's width in world units (0: a fine line)
+        std::string           text;        ///< TYPE
+        double                size = 0;    ///< TYPE: the text's height in world units
+        unsigned              color = 0;   ///< 0xRRGGBB; 0: the session's accent
+        std::vector<int>      after;       ///< pieces of the same plan (indices) done before this one starts
+        int                   hold = -1;   ///< drawn on until that piece is done (-1: fades once this one is)
+        std::string           tag;         ///< the robot's tag while it works
+        std::function<void( int )> step;   ///< each pen segment / shape as its robot finishes it (main thread)
+        std::function<void()> done;        ///< the piece finished (main thread)
+    };
+
+    /// The editor's world to the overlay this frame (points, from the docked window's content top-left):
+    /// x' = m[0] x + m[1] y + m[2], y' = m[3] x + m[4] y + m[5]. False: no view this frame (the last one stays).
+    using SWARM_VIEW = std::function<bool( double* m )>;
+
+    /// A change as a plan of pieces for the swarm; aDone runs once every piece is done. With the swarm off, every
+    /// callback runs right away.
+    void SwarmPlan( std::vector<SWARM_PIECE> aPieces, SWARM_VIEW aView, std::function<void()> aDone = nullptr );
 } // namespace WORKBENCH
 } // namespace KIPLATFORM
 

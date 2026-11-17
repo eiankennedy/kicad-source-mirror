@@ -42,5 +42,23 @@ void SwarmTarget( double, double, double, double, std::function<void()> aOnDrawn
     if( aOnDrawn )
         aOnDrawn();
 }
+void SwarmTargetLive( SWARM_WHERE, std::function<void()> aOnDrawn )
+{
+    if( aOnDrawn )
+        aOnDrawn();
+}
+void SwarmPlan( std::vector<SWARM_PIECE> aPieces, SWARM_VIEW, std::function<void()> aDone )
+{
+    for( SWARM_PIECE& p : aPieces )
+    {
+        if( p.step )
+            for( size_t i = 0; i < p.pts.size(); ++i )
+                p.step( (int) i );
+        if( p.done )
+            p.done();
+    }
+    if( aDone )
+        aDone();
+}
 } // namespace WORKBENCH
 } // namespace KIPLATFORM
